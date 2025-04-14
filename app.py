@@ -1,20 +1,22 @@
 import datetime
 import logging
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from langchain.chains.retrieval_qa.base import RetrievalQA
-from pydantic import BaseModel
 import os
 import uuid
-from database import get_db
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Pinecone
-from langchain_huggingface import HuggingFaceEmbeddings
-from pinecone import Pinecone
-from dotenv import load_dotenv
-from langchain_ollama import OllamaLLM
-from fastapi.responses import JSONResponse
 from typing import Optional, List
+
+import torch
+from dotenv import load_dotenv
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from langchain.chains.retrieval_qa.base import RetrievalQA
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
+from langchain_pinecone import PineconeVectorStore
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import OllamaLLM as Ollama
+from pinecone import Pinecone
+from pydantic import BaseModel
+from bson import ObjectId
+from pymongo import MongoClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -24,13 +26,44 @@ load_dotenv()
 
 app = FastAPI()
 
-# Initialize services
+# Initialize CUDA if available
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using device: {device}")
+
+if device == "cuda":
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('medium')
+
+# Initialize Pinecone
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-llm = OllamaLLM(model="deepseek-r1:8b", temperature=0.3)
+index = pc.Index("rag-docs")
+
+# HuggingFace embeddings with GPU support
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    model_kwargs={"device": device},
+    encode_kwargs={"device": device, "batch_size": 32}
+)
+
+vectorstore = PineconeVectorStore(
+    index=index,
+    embedding=embeddings,
+    text_key="text"
+)
+
+# Ollama model initialization
+llm = Ollama(model="deepseek-r1:1.5b", temperature=0.3)
+
+
+# MongoDB connection
+def get_db():
+    client = MongoClient(os.getenv("MONGO_URI"))
+    return client.rag_db.documents
+
+
 db = get_db()
 
-# File type handling
+# Supported file types
 SUPPORTED_TYPES = {
     ".pdf": PyPDFLoader,
     ".txt": UnstructuredFileLoader,
@@ -38,9 +71,10 @@ SUPPORTED_TYPES = {
 }
 
 
+# Request/Response models
 class DocumentRequest(BaseModel):
     filename: str
-    query: Optional[str] = None  # For query endpoint
+    query: Optional[str] = None
 
 
 class DocumentResponse(BaseModel):
@@ -49,34 +83,37 @@ class DocumentResponse(BaseModel):
     processed: bool
     file_size: int
     created_at: datetime.datetime
-    processed_at: Optional[datetime.datetime]
-    chunk_count: Optional[int]
+    processed_at: Optional[datetime.datetime] = None
+    chunk_count: Optional[int] = None
 
 
-# --- Document Management Endpoints ---
+class QueryRequest(BaseModel):
+    question: str
+    document_ids: Optional[List[str]] = None
+    k: Optional[int] = 10
+
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: List[dict]
+
 
 @app.post("/documents", response_model=DocumentResponse)
 async def add_document(file: UploadFile = File(...)):
-    """Upload and process a document for RAG"""
     file_ext = os.path.splitext(file.filename)[1].lower()
     if file_ext not in SUPPORTED_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type. Supported: {list(SUPPORTED_TYPES.keys())}"
-        )
+        raise HTTPException(400, f"Unsupported file type. Supported: {list(SUPPORTED_TYPES.keys())}")
 
     os.makedirs("documents", exist_ok=True)
-    file_uuid = uuid.uuid4()
+    file_uuid = str(uuid.uuid4())
     file_path = f"documents/{file_uuid}{file_ext}"
     doc_id = None
 
     try:
-        # Save file in chunks
         with open(file_path, "wb") as f:
-            while content := await file.read(1024 * 1024):  # 1MB chunks
+            while content := await file.read(1024 * 1024):
                 f.write(content)
 
-        # Initial DB record
         doc_data = {
             "filename": file.filename,
             "file_path": file_path,
@@ -86,18 +123,12 @@ async def add_document(file: UploadFile = File(...)):
             "created_at": datetime.datetime.utcnow(),
             "processing_start": datetime.datetime.utcnow()
         }
-        insert_result = db.insert_one(doc_data)
-        doc_id = insert_result.inserted_id
+        insert_result = db.documents.insert_one(doc_data)
+        doc_id = str(insert_result.inserted_id)
 
-        # Document processing
-        try:
-            loader = SUPPORTED_TYPES[file_ext](file_path)
-            pages = loader.load_and_split()
-        except Exception as e:
-            logger.error(f"Document parsing failed: {e}", exc_info=True)
-            raise HTTPException(422, "Document parsing failed")
+        loader = SUPPORTED_TYPES[file_ext](file_path)
+        pages = loader.load()
 
-        # Text splitting with metadata
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=100,
@@ -106,31 +137,17 @@ async def add_document(file: UploadFile = File(...)):
         )
         chunks = splitter.split_documents(pages)
 
-        # Enhanced metadata
         for i, chunk in enumerate(chunks):
             chunk.metadata.update({
                 "source_file": file.filename,
-                "document_id": str(doc_id),
+                "document_id": doc_id,
                 "chunk_index": i,
                 "total_chunks": len(chunks),
                 "file_type": file_ext[1:]
             })
 
-        # Vector storage
-        try:
-            Pinecone.from_documents(
-                documents=chunks,
-                embedding=embeddings,
-                index=pc.Index("rag-docs"),
-                namespace=str(file_uuid),
-                batch_size=50,
-                show_progress=True
-            )
-        except Exception as e:
-            logger.error(f"Pinecone error: {e}")
-            raise HTTPException(503, "Vector storage service unavailable")
+        vectorstore.add_documents(documents=chunks, namespace=file_uuid)
 
-        # Update document status
         update_data = {
             "processed": True,
             "processed_at": datetime.datetime.utcnow(),
@@ -139,114 +156,127 @@ async def add_document(file: UploadFile = File(...)):
                     datetime.datetime.utcnow() - doc_data["processing_start"]
             ).total_seconds()
         }
-        db.update_one({"_id": doc_id}, {"$set": update_data})
+        db.documents.update_one({"_id": ObjectId(doc_id)}, {"$set": update_data})
 
-        return {
-            "id": str(doc_id),
-            "filename": file.filename,
-            "processed": True,
-            "file_size": doc_data["file_size"],
-            "created_at": doc_data["created_at"],
-            "processed_at": update_data["processed_at"],
-            "chunk_count": update_data["chunk_count"]
-        }
+        return DocumentResponse(
+            id=doc_id,
+            filename=file.filename,
+            processed=True,
+            file_size=doc_data["file_size"],
+            created_at=doc_data["created_at"],
+            processed_at=update_data["processed_at"],
+            chunk_count=update_data["chunk_count"]
+        )
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        # Cleanup
+        logger.error(f"Document processing failed: {e}", exc_info=True)
         if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except OSError:
-                pass
+            os.remove(file_path)
         if doc_id:
-            db.delete_one({"_id": doc_id})
-        raise HTTPException(500, "Document processing failed")
+            db.documents.delete_one({"_id": ObjectId(doc_id)})
+        raise HTTPException(500, f"Document processing failed: {str(e)}")
 
 
 @app.delete("/documents/{document_id}")
 async def delete_document(document_id: str):
-    """Delete a document and its vectors"""
     try:
-        document = db.find_one({"_id": ObjectId(document_id)})
+        try:
+            obj_id = ObjectId(document_id)
+        except:
+            raise HTTPException(400, "Invalid document ID format")
+
+        document = db.documents.find_one({"_id": obj_id})
         if not document:
             raise HTTPException(404, "Document not found")
 
-        # Delete from Pinecone
-        index = pc.Index("rag-docs")
-        index.delete(
-            filter={
-                "document_id": document_id,
-                "source_file": document["filename"]
-            }
+        pc.Index("rag-docs").delete(
+            namespace=os.path.splitext(os.path.basename(document["file_path"]))[0],
+            filter={"document_id": document_id}
         )
 
-        # Delete local file
         if os.path.exists(document["file_path"]):
             os.remove(document["file_path"])
 
-        # Delete from MongoDB
-        db.delete_one({"_id": ObjectId(document_id)})
+        db.documents.delete_one({"_id": obj_id})
 
         return {"status": "success", "deleted_id": document_id}
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Deletion error: {e}")
-        raise HTTPException(500, "Deletion failed")
+        logger.error(f"Deletion failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Deletion failed: {str(e)}")
 
 
 @app.get("/documents", response_model=List[DocumentResponse])
 async def list_documents(limit: int = 100, skip: int = 0):
-    """List all documents with pagination"""
     try:
         documents = []
-        for doc in db.find().skip(skip).limit(limit):
-            documents.append({
-                "id": str(doc["_id"]),
-                "filename": doc["filename"],
-                "processed": doc.get("processed", False),
-                "file_size": doc.get("file_size", 0),
-                "created_at": doc.get("created_at"),
-                "processed_at": doc.get("processed_at"),
-                "chunk_count": doc.get("chunk_count")
-            })
+        for doc in db.documents.find().skip(skip).limit(limit):
+            documents.append(DocumentResponse(
+                id=str(doc["_id"]),
+                filename=doc["filename"],
+                processed=doc.get("processed", False),
+                file_size=doc.get("file_size", 0),
+                created_at=doc.get("created_at"),
+                processed_at=doc.get("processed_at"),
+                chunk_count=doc.get("chunk_count")
+            ))
         return documents
     except Exception as e:
-        logger.error(f"Listing error: {e}")
-        raise HTTPException(500, "Failed to retrieve documents")
+        logger.error(f"Listing failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Failed to retrieve documents: {str(e)}")
 
 
-@app.post("/query")
-async def query_documents(request: DocumentRequest):
-    """Query a specific document"""
+@app.post("/query", response_model=QueryResponse)
+async def ask_question(request: QueryRequest):
     try:
-        document = db.find_one({"filename": request.filename})
-        if not document:
-            raise HTTPException(404, "Document not found")
+        filter_dict = None
+        if request.document_ids:
+            try:
+                [ObjectId(doc_id) for doc_id in request.document_ids]
+                filter_dict = {"document_id": {"$in": request.document_ids}}
+            except:
+                raise HTTPException(400, "Invalid document ID format")
 
-        vectorstore = Pinecone(
-            index=pc.Index("rag-docs"),
-            embedding=embeddings,
-            namespace=str(document["_id"])
+        retriever = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={
+                "k": request.k or 5,
+                "filter": filter_dict
+            }
         )
 
-        qa_chain = RetrievalQA.from_chain_type(
+        qa = RetrievalQA.from_chain_type(
             llm=llm,
-            retriever=vectorstore.as_retriever(
-                search_kwargs={
-                    "k": 3,
-                    "filter": {"document_id": str(document["_id"])}
-                }
-            )
+            chain_type="stuff",
+            retriever=retriever,
+            return_source_documents=True
         )
-        result = qa_chain({"query": request.query})
-        return {
-            "response": result["result"],
-            "source_document": request.filename,
-            "document_id": str(document["_id"])
-        }
+
+        result = qa({"query": request.question})
+
+        sources = []
+        for doc in result.get("source_documents", []):
+            sources.append({
+                "document_id": doc.metadata.get("document_id"),
+                "source_file": doc.metadata.get("source_file"),
+                "chunk_index": doc.metadata.get("chunk_index"),
+                "page_content": doc.page_content[:200] + ("..." if len(doc.page_content) > 200 else "")
+            })
+
+        return QueryResponse(
+            answer=result.get("result", "No answer found"),
+            sources=sources
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Query error: {e}")
-        raise HTTPException(500, "Query processing failed")
+        logger.error(f"Question answering failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Question answering failed: {str(e)}")
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
