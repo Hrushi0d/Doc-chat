@@ -109,7 +109,7 @@ def process_document(file_path: str, file_ext: str) -> dict:
                     "file_type": file_ext[1:]
                 })
 
-            vectorstore.add_documents(documents=chunks, namespace=file_uuid)
+            vectorstore.add_documents(documents=chunks, namespace="ollamarag1")
         except Exception as e:
             raise Exception(f"Pinecone error: {str(e)}")
 

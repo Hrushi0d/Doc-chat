@@ -34,7 +34,7 @@ if device == "cuda":
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('medium')
 
-# Initialize Pinecone
+# Initialize Pinecone Vector Database
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index = pc.Index("rag-docs")
 
@@ -234,17 +234,20 @@ async def ask_question(request: QueryRequest):
         filter_dict = None
         if request.document_ids:
             try:
-                [ObjectId(doc_id) for doc_id in request.document_ids]
                 filter_dict = {"document_id": {"$in": request.document_ids}}
-            except:
+            except Exception as e:
                 raise HTTPException(400, "Invalid document ID format")
+
+        search_kwargs = {
+            "k": request.k or 5,
+            "namespace": "ollamarag1"
+        }
+        if filter_dict:
+            search_kwargs["filter"] = filter_dict
 
         retriever = vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={
-                "k": request.k or 5,
-                "filter": filter_dict
-            }
+            search_kwargs=search_kwargs
         )
 
         qa = RetrievalQA.from_chain_type(
