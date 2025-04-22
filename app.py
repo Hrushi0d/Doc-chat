@@ -52,8 +52,10 @@ vectorstore = PineconeVectorStore(
 )
 
 # Ollama model initialization
-llm = Ollama(model="deepseek-r1:1.5b", temperature=0.3)
-
+llms = {
+    'deepseek-r1': Ollama(model="deepseek-r1:1.5b", temperature=0.3),
+    'deepseek-coder': Ollama(model="deepseek-coder", temperature=0.3)
+}
 
 # MongoDB connection
 def get_db():
@@ -91,11 +93,13 @@ class QueryRequest(BaseModel):
     question: str
     document_ids: Optional[List[str]] = None
     k: Optional[int] = 10
+    model: Optional[str] = "deepseek-r1"
 
 
 class QueryResponse(BaseModel):
     answer: str
     sources: List[dict]
+    model: str
 
 
 @app.post("/documents", response_model=DocumentResponse)
@@ -251,13 +255,13 @@ async def ask_question(request: QueryRequest):
         )
 
         qa = RetrievalQA.from_chain_type(
-            llm=llm,
+            llm=llms[request.model],
             chain_type="stuff",
             retriever=retriever,
             return_source_documents=True
         )
 
-        result = qa({"query": request.question})
+        result = qa.invoke({"query": request.question})
 
         sources = []
         for doc in result.get("source_documents", []):
@@ -270,7 +274,8 @@ async def ask_question(request: QueryRequest):
 
         return QueryResponse(
             answer=result.get("result", "No answer found"),
-            sources=sources
+            sources=sources,
+            model=request.model
         )
 
     except HTTPException:
