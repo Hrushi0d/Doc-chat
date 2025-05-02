@@ -1,22 +1,20 @@
-import datetime
 import logging
 import os
-import uuid
+import time
 from typing import Optional, List
 
 import torch
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException
 from langchain.chains.retrieval_qa.base import RetrievalQA
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
-from langchain_pinecone import PineconeVectorStore
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM as Ollama
+from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone
 from pydantic import BaseModel
-from bson import ObjectId
 from pymongo import MongoClient
+from starlette.middleware.cors import CORSMiddleware
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +23,14 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins; replace with specific domains in production
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
 
 # Initialize CUDA if available
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -84,10 +90,12 @@ class QueryResponse(BaseModel):
     answer: str
     sources: List[dict]
     model: str
+    # time: str
 
 
 @app.post("/query", response_model=QueryResponse)
 async def ask_question(request: QueryRequest):
+    # start_time = time.time()
     try:
         filter_dict = None
         if request.document_ids:
@@ -125,11 +133,13 @@ async def ask_question(request: QueryRequest):
                 "chunk_index": doc.metadata.get("chunk_index"),
                 "page_content": doc.page_content[:200] + ("..." if len(doc.page_content) > 200 else "")
             })
-
+        # end_time = time.time()
+        # time_elapsed = f"Execution completed in {end_time - start_time:.2f} seconds"
         return QueryResponse(
             answer=result.get("result", "No answer found"),
             sources=sources,
             model=request.model
+            # ,time=time_elapsed
         )
 
     except HTTPException:
