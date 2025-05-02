@@ -1,6 +1,5 @@
 import logging
 import os
-import time
 from typing import Optional, List
 
 import torch
@@ -11,9 +10,9 @@ from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLo
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM as Ollama
 from langchain_pinecone import PineconeVectorStore
+from motor.motor_asyncio import AsyncIOMotorClient
 from pinecone import Pinecone
 from pydantic import BaseModel
-from pymongo import MongoClient
 from starlette.middleware.cors import CORSMiddleware
 
 # Configure logging
@@ -24,6 +23,7 @@ load_dotenv()
 
 app = FastAPI()
 
+# CORS middleware setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allows all origins; replace with specific domains in production
@@ -40,44 +40,54 @@ if device == "cuda":
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('medium')
 
-# Initialize Pinecone Vector Database
-pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-index = pc.Index("rag-docs")
+# Async function for Pinecone initialization
+async def init_pinecone():
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    index = pc.Index("rag-docs")
+    return index
 
-# HuggingFace embeddings with GPU support
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": device},
-    encode_kwargs={"device": device, "batch_size": 32}
-)
+# Async function for MongoDB connection
+async def get_db():
+    client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
+    db = client.rag_db.documents
+    return db
 
-vectorstore = PineconeVectorStore(
-    index=index,
-    embedding=embeddings,
-    text_key="text"
-)
-
-# Ollama model initialization
+# Ollama model initialization (This can stay synchronous)
 llms = {
     'deepseek-r1': Ollama(model="deepseek-r1:1.5b", temperature=0.3),
     'deepseek-coder': Ollama(model="deepseek-coder", temperature=0.3)
 }
 
-# MongoDB connection
-def get_db():
-    client = MongoClient(os.getenv("MONGO_URI"))
-    return client.rag_db.documents
+# Initialize Pinecone VectorStore
+async def init_vectorstore():
+    index = await init_pinecone()
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": device},
+        encode_kwargs={"device": device, "batch_size": 32}
+    )
+    vectorstore = PineconeVectorStore(
+        index=index,
+        embedding=embeddings,
+        text_key="text"
+    )
+    return vectorstore
 
+# MongoDB database initialization on app startup
+@app.on_event("startup")
+async def startup_event():
+    global db, vectorstore
+    db = await get_db()
+    vectorstore = await init_vectorstore()  # Initialize vectorstore
 
-db = get_db()
-
-# Supported file types
+# Supported file types (remains the same)
 SUPPORTED_TYPES = {
     ".pdf": PyPDFLoader,
     ".txt": UnstructuredFileLoader,
     ".docx": UnstructuredFileLoader
 }
 
+# FastAPI app ready for async operations
 
 class QueryRequest(BaseModel):
     question: str
@@ -147,8 +157,3 @@ async def ask_question(request: QueryRequest):
     except Exception as e:
         logger.error(f"Question answering failed: {e}", exc_info=True)
         raise HTTPException(500, f"Question answering failed: {str(e)}")
-
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
